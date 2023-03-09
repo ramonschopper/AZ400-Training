@@ -7,6 +7,10 @@ terraform {
   }
 }
 
+provider "azurerm" {
+  features {}
+}
+
 resource "azurerm_resource_group" "base-rg" {
   name     = "rg-chn-webapp-${var.environment}"
   location = var.location
