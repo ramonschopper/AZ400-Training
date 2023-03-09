@@ -3,7 +3,7 @@ terraform {
     resource_group_name  = "rg-chn-tfstate"
     storage_account_name = "straz400tfstate"
     container_name       = "corporate-web"
-    key                  = "${var.environment}.tfstate"
+    key                  = "state.tfstate"
   }
 }
 
