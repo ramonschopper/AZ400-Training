@@ -1,0 +1,182 @@
+{
+    "name": "good-books",
+    "fields": [
+        {
+            "name": "book_id",
+            "type": "Edm.String",
+            "facetable": false,
+            "filterable": false,
+            "key": true,
+            "searchable": true,
+            "sortable": false,
+            "analyzer": "standard.lucene"
+        },
+        {
+            "name": "goodreads_book_id",
+            "type": "Edm.Int64",
+            "searchable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "best_book_id",
+            "type": "Edm.Int64",
+            "searchable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "work_id",
+            "type": "Edm.Int64",
+            "searchable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "books_count",
+            "type": "Edm.Int32",
+            "searchable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "isbn",
+            "type": "Edm.String",
+            "searchable": true,
+            "filterable": false,
+            "sortable": false,
+            "facetable": false,
+            "analyzer": "standard.lucene"
+        },
+        {
+            "name": "isbn13",
+            "type": "Edm.Double",
+            "sortable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "authors",
+            "type": "Edm.String",
+            "searchable": true,
+            "filterable": true,
+            "sortable": false,
+            "facetable": true,
+            "analyzer": "standard.lucene"
+        },
+        {
+            "name": "original_publication_year",
+            "type": "Edm.Double",
+            "searchable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "original_title",
+            "type": "Edm.String",
+            "searchable": true,
+            "filterable": false,
+            "sortable": true,
+            "facetable": false,
+            "analyzer": "standard.lucene"
+        },
+        {
+            "name": "title",
+            "type": "Edm.String",
+            "searchable": true,
+            "filterable": false,
+            "sortable": true,
+            "facetable": false,
+            "analyzer": "standard.lucene"
+        },
+        {
+            "name": "language_code",
+            "type": "Edm.String",
+            "searchable": false,
+            "filterable": true,
+            "sortable": false,
+            "facetable": true
+        },
+        {
+            "name": "average_rating",
+            "type": "Edm.String",
+            "filterable": true,
+            "sortable": true,
+            "facetable": true
+        },
+        {
+            "name": "ratings_count",
+            "type": "Edm.Int64",
+            "sortable": true,
+            "filterable": true,
+            "facetable": true
+        },
+        {
+            "name": "work_ratings_count",
+            "type": "Edm.Int64",
+            "sortable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "work_text_reviews_count",
+            "type": "Edm.Int64",
+            "sortable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "ratings_1",
+            "type": "Edm.Int64",
+            "sortable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "ratings_2",
+            "type": "Edm.Int64",
+            "sortable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "ratings_3",
+            "type": "Edm.Int64",
+            "sortable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "ratings_4",
+            "type": "Edm.Int64",
+            "sortable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "ratings_5",
+            "type": "Edm.Int64",
+            "sortable": false,
+            "filterable": false,
+            "facetable": false
+        },
+        {
+            "name": "image_url",
+            "type": "Edm.String",
+            "searchable": true,
+            "filterable": false,
+            "sortable": false,
+            "facetable": false,
+            "analyzer": "standard.lucene"
+        },
+        {
+            "name": "small_image_url",
+            "type": "Edm.String",
+            "searchable": true,
+            "filterable": false,
+            "sortable": false,
+            "facetable": false,
+            "analyzer": "standard.lucene"
+        }
+    ]
+}

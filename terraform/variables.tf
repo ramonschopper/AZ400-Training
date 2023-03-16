@@ -1,2 +1,11 @@
-variable "environment" {}
+variable "subscriptionId" {}
+variable "tenantId" {}
+variable "resourceGroup" {}
 variable "location" {}
+variable "ownerObjectId" {}
+variable "tags" {}
+variable "resourceNaming" {}
+variable "sqlAADAdminGroup" {}
+variable "sqlDbGeneralPurposeConfig" {}
+variable "acsConfig" {}
+variable "appRegistration" {}

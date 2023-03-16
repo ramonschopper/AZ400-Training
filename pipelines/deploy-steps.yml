@@ -1,0 +1,445 @@
+parameters:
+  - name: tfVersion
+    displayName: Terraform version
+    type: string
+  - name: environment
+    type: string
+    default:
+  - name: serviceConnectionName
+    type: string
+    default: 
+  - name: rsgName
+    type: string
+    default: 
+  - name: stgName
+    type: string
+    default: 
+  - name: tfvarsName
+    type: string
+    default: 
+  - name: tfPlanOnly
+    displayName: Run Terraform plan only
+    type: boolean
+    default: true
+  - name: tfDirName
+    type: string
+  - name: updateSecrets
+    type: boolean
+  - name: webAppComponentName
+    type: string
+  - name: envEnabled
+    type: boolean
+
+stages:
+  - stage: "${{ parameters.environment }}"
+    condition: eq('${{ parameters.envEnabled }}', 'true')
+    jobs:
+      - job: DeployInfrastructure${{ parameters.environment }}
+
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Create Resource Group and Storage Account for TF State" # Will be created if does not already exist
+            inputs:
+              azureSubscription: "${{ parameters.serviceConnectionName}}"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az group create -l westeurope -n ${{ parameters.rsgName }}
+                az storage account create -n ${{ parameters.stgName }} -g ${{ parameters.rsgName }} -l switzerlandnorth --sku Standard_GRS --kind StorageV2 --allow-blob-public-access false
+                az storage container create -n tfstate --account-name ${{ parameters.stgName }}
+                az storage account update --name ${{ parameters.stgName }} --resource-group ${{ parameters.rsgName }} --min-tls-version TLS1_2 # enforce TLS 1.2
+                az security atp storage update --resource-group ${{ parameters.rsgName }} --storage-account ${{ parameters.stgName }} --is-enabled true # enable ATP
+                az storage account update --default-action Deny --name ${{ parameters.stgName }} --resource-group ${{ parameters.rsgName }}
+              failOnStandardError: false
+            enabled: true
+
+          - task: AzureCLI@2
+            displayName: Add ADO agent public IP to Key Vaults, storage accounts and Container Registries
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnectionName }}
+              addSpnToEnvironment: true
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $ado_agent_ip = curl ifconfig.me
+                $serviceList = @("keyvault", "storage account", "acr")
+                $listNetworkRulesCmd = @() # array of commands to list IPs of each resource (used to check rules are in place at end)
+                if ($serviceList.Count -gt 0) {
+                    $serviceList.foreach({
+                        if ($_ -eq "") { return }      
+                        $resourceType = $_
+                        $cmd = "az $resourceType list -g ${{ parameters.rsgName }}"
+                        $resourceList = Invoke-Expression $cmd | ConvertFrom-Json
+                        $resourceList.foreach({
+                            $resourceInfo = $_.id.split('/')
+                            $resourceName = $resourceInfo[8]
+                            switch ($resourceType) {       
+                                "keyvault" {
+                                    $cmd = "az $_ network-rule add --ip-address $ado_agent_ip -n $resourceName -g ${{ parameters.rsgName }} --no-wait"
+                                    $listNetworkRulesCmd += "az $_ network-rule list -n $resourceName -g ${{ parameters.rsgName }}"
+                                }
+                                default {    
+                                    $cmd = "az $_ network-rule add --ip-address $ado_agent_ip -n $resourceName -g ${{ parameters.rsgName }}"
+                                    $listNetworkRulesCmd += "az $_ network-rule list -n $resourceName -g ${{ parameters.rsgName }}"
+                                }
+                            }
+                            Write-Host "Adding IP $ado_agent_ip to $resourceType $resourceName in ${{ parameters.rsgName }}"
+                            Invoke-Expression $cmd            
+                        })
+                    })
+                    Write-Host "Waiting for rules to be in place..."    
+                    $timelimit = 200
+                    $trackCmd = @()
+                    $found = 0
+                    $start = [Math]::Floor([decimal](Get-Date(Get-Date).ToUniversalTime()-uformat "%s"))
+                    if ($listNetworkRulesCmd.Count -gt 0) {
+                        while($found -lt $listNetworkRulesCmd.Count)
+                        {
+                            sleep 1
+                            $listNetworkRulesCmd.foreach({
+                                $config = Invoke-Expression $_
+                                if ($config -like "*$ado_agent_ip*") {
+                                    if ($trackCmd -notcontains $_) {
+                                        $trackCmd += $trackCmd
+                                        $found++                            
+                                    }
+                                }
+                            })
+                            $lapsed = [Math]::Floor([decimal](Get-Date(Get-Date).ToUniversalTime()-uformat "%s")) - $start 
+                            if ($lapsed -gt $timelimit) {
+                                Write-Warning "Wait Timeout"
+                                break;
+                            }
+                        }
+                    }
+                }
+                Write-Host "Checking access to terraform state storage account..."
+                while ($container -eq $null) { # random wait time between 20 and 30 seconds
+                      sleep (Get-Random -Minimum 20 -Maximum 30)
+                      Write-Host "Checking if firewall rules are effective for the tfstate storage account"
+                      $container=az storage container exists --account-name ${{ parameters.stgName }} --name tfstate --auth-mode login # will return error if firewall is enabled
+                      if (!$?) {
+                        Write-Host "Firewall is still blocking access to tfstate... retrying..."
+                      }
+                }
+                Write-Host "TFState storage account firewall is enabled for the Azure DevOps agent... Continuing with pipeline execution..."
+                exit 0
+            enabled: true
+
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@0
+            displayName: Install Terraform version ${{ parameters.tfVersion }}
+            inputs:
+              terraformVersion: ${{ parameters.tfVersion }}
+            enabled: true
+
+          - task: AzureCLI@2
+            displayName: "Terraform plan and apply"
+            name: TFPlanApply
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnectionName }}
+              scriptType: bash
+              addSpnToEnvironment: true
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "##[command]Export variables"
+                export ARM_TENANT_ID=$tenantId # get tenant id from environment variables
+                export ARM_SUBSCRIPTION_ID=$(az account show --query 'id' --output tsv)
+                export ARM_CLIENT_ID=$servicePrincipalId  # get client id from environment variables
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                echo "##[command]Run Terraform init"
+                terraform -chdir=./${{ parameters.tfDirName }} init -input=false -reconfigure -backend-config="resource_group_name=${{ parameters.rsgName }}" -backend-config="storage_account_name=${{ parameters.stgName }}" -backend-config="container_name=tfstate" -backend-config="key=infrabaseline.tfstate"
+                echo "##[command]Run Terraform plan"
+                terraform -chdir=./${{ parameters.tfDirName }} plan -input=false -out=tfplan -var-file=$(System.DefaultWorkingDirectory)/configuration/${{parameters.tfvarsName}}
+                if [ '${{ parameters.tfPlanOnly }}' == 'False' ]; then
+                  echo "##[command]Run Terraform apply"
+                  terraform -chdir=./${{ parameters.tfDirName }} apply -input=false -auto-approve tfplan
+
+                  echo "##[command]Run Terraform output"
+
+                  acsName="$(terraform -chdir=./${{ parameters.tfDirName }} output -raw acsName)"
+                  echo "##[command]acsName = $acsName"
+                  echo "##vso[task.setvariable variable=acsName;isOutput=true;]$(echo $acsName)"
+
+                  acsResourceGroupName="$(terraform -chdir=./${{ parameters.tfDirName }} output -raw acsResourceGroupName)"
+                  echo "##[command]acsResourceGroupName = $acsResourceGroupName"
+                  echo "##vso[task.setvariable variable=acsResourceGroupName;isOutput=true;]$(echo $acsResourceGroupName)"
+
+                  sqlFqdn="$(terraform -chdir=./${{ parameters.tfDirName }} output -raw sqlFqdn)"
+                  echo "##[command]sqlFqdn = $sqlFqdn"
+                  echo "##vso[task.setvariable variable=sqlFqdn;isOutput=true;]$(echo $sqlFqdn)"
+
+                  sqlResourceId="$(terraform -chdir=./${{ parameters.tfDirName }} output -raw sqlResourceId)"
+                  echo "##[command]sqlResourceId = $sqlResourceId"
+                  echo "##vso[task.setvariable variable=sqlResourceId;isOutput=true;]$(echo $sqlResourceId)"
+
+                  dbResourceId="$(terraform -chdir=./${{ parameters.tfDirName }} output -raw dbResourceId)"
+                  echo "##[command]dbResourceId = $dbResourceId"
+                  echo "##vso[task.setvariable variable=dbResourceId;isOutput=true;]$(echo $dbResourceId)"
+
+                  sqlResourceName="$(terraform -chdir=./${{ parameters.tfDirName }} output -raw sqlResourceName)"
+                  echo "##[command]sqlResourceName = $sqlResourceName"
+                  echo "##vso[task.setvariable variable=sqlResourceName;isOutput=true;]$(echo $sqlResourceName)"
+
+                  dbResourceName="$(terraform -chdir=./${{ parameters.tfDirName }} output -raw dbResourceName)"
+                  echo "##[command]dbResourceName = $dbResourceName"
+                  echo "##vso[task.setvariable variable=dbResourceName;isOutput=true;]$(echo $dbResourceName)"
+
+                  acrName="$(terraform -chdir=./${{ parameters.tfDirName }} output -raw acrName)"
+                  echo "##[command]acrName = $acrName"
+                  echo "##vso[task.setvariable variable=acrName;isOutput=true;]$(echo $acrName)"
+
+                  aasName="$(terraform -chdir=./${{ parameters.tfDirName }} output -raw aasName)"
+                  echo "##[command]aasName = $aasName"
+                  echo "##vso[task.setvariable variable=aasName;isOutput=true;]$(echo $aasName)"
+                else
+                  echo "Pipeline was executed in 'plan only' mode. To apply changes uncheck the 'Run Terraform plan only' parameter when running the Azure DevOps pipeline"
+                fi
+              failOnStandardError: true
+            enabled: true
+
+          - task: AzureCLI@2
+            displayName: Remove ADO agent public IP from Key Vaults, Storage Accounts and Container Registries
+            condition: always() # this will always run, even if the pipeline is canceled
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnectionName }}
+              addSpnToEnvironment: true
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $ado_agent_ip = curl ifconfig.me
+                $serviceList = @("keyvault", "storage account", "acr")
+                if ($serviceList.Count -gt 0) {
+                    $serviceList.foreach({
+                        if ($_ -eq "") { return }
+                        $resourceType = $_
+                        $cmd = "az $resourceType list -g ${{ parameters.rsgName }}"
+                        $resourceList = Invoke-Expression $cmd | ConvertFrom-Json
+                        $resourceList.foreach({
+                            $resourceInfo = $_.id.split('/')
+                            $resourceName = $resourceInfo[8]
+                            switch ($resourceType) {
+                                "keyvault" {
+                                    $cmd = "az $_ network-rule remove --ip-address $ado_agent_ip/32 -n $resourceName -g ${{ parameters.rsgName }} --no-wait"
+                                }
+                                default {    
+                                    $cmd = "az $_ network-rule remove --ip-address $ado_agent_ip -n $resourceName -g ${{ parameters.rsgName }}"
+                                }
+                            }
+                            Write-Host "Removing IP $ado_agent_ip from $resourceType $resourceName in ${{ parameters.rsgName }}"
+                            Invoke-Expression $cmd
+                        })
+                    })
+                }
+            enabled: true
+
+      - job: BuildContainer${{ parameters.environment }}
+        dependsOn:
+        - DeployInfrastructure${{ parameters.environment }}
+        condition: succeeded()
+
+        variables:
+          acrResourceName: $[ dependencies.DeployInfrastructure${{ parameters.environment }}.outputs['TFPlanApply.acrName'] ]
+        
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            name: login
+            displayName: Docker login
+            enabled: true
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnectionName }}'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az --version
+                az account show
+                az acr login --name $(acrResourceName)
+
+          - task: AzureCLI@2
+          # This step will build our docker image to run the Web App component
+            name: build
+            displayName: Docker build
+            enabled: true
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnectionName }}'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                docker build -t ${{ lower(parameters.webappComponentName) }}:latest app/.
+                docker tag ${{ lower(parameters.webappComponentName) }}:latest $(acrResourceName).azurecr.io/${{ lower(parameters.webappComponentName) }}:latest
+
+          - task: AzureCLI@2
+            name: push
+            displayName: Docker push
+            enabled: true
+            inputs:
+              azureSubscription: '${{ parameters.serviceConnectionName }}'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                docker push $(acrResourceName).azurecr.io/${{ lower(parameters.webappComponentName) }}:latest 
+
+      
+      - job: PrepareDatabase${{ parameters.environment }}
+        dependsOn:
+        - DeployInfrastructure${{ parameters.environment }}
+        condition: succeeded()
+
+        variables:
+        # This variables will set all the Terraform output Job variables as local variables in this job
+          sqlFqdn: $[ dependencies.DeployInfrastructure${{ parameters.environment }}.outputs['TFPlanApply.sqlFqdn'] ]
+          sqlResourceId: $[ dependencies.DeployInfrastructure${{ parameters.environment }}.outputs['TFPlanApply.sqlResourceId'] ]
+          sqlResourceName: $[ dependencies.DeployInfrastructure${{ parameters.environment }}.outputs['TFPlanApply.sqlResourceName'] ]
+          acsName: $[ dependencies.DeployInfrastructure${{ parameters.environment }}.outputs['TFPlanApply.acsName'] ]
+          dbResourceName: $[ dependencies.DeployInfrastructure${{ parameters.environment }}.outputs['TFPlanApply.dbResourceName'] ]
+
+        steps:
+          - task: AzureCLI@2
+            displayName: Add ADO agent public IP to SQL Server and Cognitive Search
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnectionName }}
+              addSpnToEnvironment: true
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $ado_agent_ip = curl ifconfig.me
+                Write-Host "Adding $ado_agent_ip to SQL Server $(sqlResourceName)"
+                az sql server firewall-rule create -g ${{ parameters.rsgName }} -s $(sqlResourceName) -n DevopsAgentTemp --start-ip-address $ado_agent_ip --end-ip-address $ado_agent_ip
+                
+                Write-Host "Adding $ado_agent_ip to Cognitive Search $(acsName)"
+                $currentIps = (az search service show --name $(acsName) --resource-group ${{ parameters.rsgName }} | ConvertFrom-Json).networkRuleSet.ipRules.value
+                If ($currentIps -notcontains $ado_agentip){
+                  $acsAllowedIps = ($currentIps -join ",") + "," + $ado_agent_ip
+                  az search service update --name $(acsName) --resource-group ${{ parameters.rsgName }} --ip-rules $acsAllowedIps
+                }
+            enabled: true
+
+          - task: AzureCLI@2
+            displayName: Deploy database schema and data
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnectionName }}
+              addSpnToEnvironment: true
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                Write-Host "Issuing access token for SQL database access..."
+                $body = @{ resource="https://database.windows.net/"; grant_type="client_credentials"; client_id=$env:servicePrincipalId; client_secret=$env:servicePrincipalKey }
+                $contentType = "application/x-www-form-urlencoded"
+                $request = Invoke-WebRequest -Method POST -Uri "https://login.microsoftonline.com/$env:tenantId/oauth2/token" -Body $body -ContentType $contentType
+                $access_token = ($request.content | ConvertFrom-Json).access_token
+                $sqlScriptPath = "data/books.sql"
+                Install-Module -Name 'SQLServer' -Scope CurrentUser -Force
+                
+                Write-Host "Preparing SQL script and replace UMI token with $(acsName)"
+                # Replace Managed Identity in SQL Script
+                $sqlScript = Get-Content $sqlScriptPath
+                $sqlScript = $sqlScript.Replace("##acsManagedIdentity##", "$(acsName)")
+                $sqlScript = $sqlScript.Replace("##dbResourceName##", "$(dbResourceName)")
+                $sqlScript | Set-Content $sqlScriptPath
+                Invoke-Sqlcmd -ServerInstance $(sqlFqdn) -Database $(dbResourceName) -AccessToken $access_token -InputFile $sqlScriptPath
+              enabled: true
+
+          - task: AzureCLI@2
+          # This step configures the indexer on the Cogntivie Search Service. It executes the following step:
+          # 1. Creating an index based on the books-index.json inside the data folder
+          # 2. Creating a datasource to reference the SQL database deployed earlier including its Connection String using Managed Identity of the Search service
+          # 3. Creating an indexer to make sure the index of the SQL database tables is indexed
+            displayName: Deploy Cognitive Search Index, Data Source and Indexer
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnectionName }}
+              addSpnToEnvironment: true
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $body = @{ resource="https://search.azure.com/"; grant_type="client_credentials"; client_id=$env:servicePrincipalId; client_secret=$env:servicePrincipalKey }
+                $contentType = "application/x-www-form-urlencoded"
+                $request = Invoke-WebRequest -Method POST -Uri "https://login.microsoftonline.com/$env:tenantId/oauth2/token" -Body $body -ContentType $contentType
+                $access_token = ($request.content | ConvertFrom-Json).access_token
+                if ($access_token) {
+                  Write-Host "Checking index status..."
+                  $index = (Invoke-RestMethod -Method GET -Uri "https://$(acsName).search.windows.net/indexes?api-version=2020-06-30" -ContentType "application/json" -headers @{ authorization="Bearer $access_token" })
+                  If ($index.value.name -eq 'good-books'){Invoke-RestMethod -Method DELETE -Uri "https://$(acsName).search.windows.net/indexes/good-books/?api-version=2020-06-30" -ContentType "application/json" -headers @{ authorization="Bearer $access_token" }}
+                  Write-Host "Recreating index..."
+                  $body = "data/books-index.json"
+                  $newIndex = Invoke-RestMethod -Method POST -Uri "https://$(acsName).search.windows.net/indexes?api-version=2020-06-30" -infile $body -ContentType "application/json" -headers @{ authorization="Bearer $access_token" }
+                  
+                  Write-Host "Created Index: $newIndex"
+
+                  Write-Host "Checking data source status..."
+                  $dbsource = (Invoke-RestMethod -Method GET -Uri "https://$(acsName).search.windows.net/datasources?api-version=2020-06-30" -ContentType "application/json" -headers @{ authorization="Bearer $access_token" })
+                  If ($dbsource.value.name -eq 'books-datasource'){$dbsource = Invoke-RestMethod -Method DELETE -Uri "https://$(acsName).search.windows.net/datasources/books-datasource?api-version=2020-06-30" -ContentType "application/json" -headers @{ authorization="Bearer $access_token" }}
+                  Write-Host "Recreating data source..."
+                  $body = @{
+                    name   = "books-datasource"
+                    type   = "azuresql"        
+                    credentials = @{
+                      'connectionString' = "Database=$(dbResourceName);ResourceId=$(sqlResourceId);Connection Timeout=30;"
+                    }
+                    container = @{ 
+                      'name' = "books" 
+                    }
+                  } | ConvertTo-Json -Compress -Depth 100
+
+                  $newDataSource = Invoke-RestMethod -Method POST -Uri "https://$(acsName).search.windows.net/datasources?api-version=2020-06-30" -body $body -ContentType "application/json" -headers @{ authorization="Bearer $access_token" }
+                  Write-Host "Created DataSource:"
+                  Write-Host $newDataSource
+
+                  Write-Host "Checking indexer status..."
+                  $indexer = (Invoke-RestMethod -Method GET -Uri "https://$(acsName).search.windows.net/indexers?api-version=2020-06-30" -ContentType "application/json" -headers @{ authorization="Bearer $access_token" })
+                  If ($indexer.value.name -eq 'good-books-indexer'){$newIndex = Invoke-RestMethod -Method DELETE -Uri "https://$(acsName).search.windows.net/indexers/good-books-indexer?api-version=2020-06-30" -ContentType "application/json" -headers @{ authorization="Bearer $access_token" }}
+                  Write-Host "Recreating new indexer..."
+                  $body = @{
+                    name            = "good-books-indexer"
+                    dataSourceName  = "books-datasource"
+                    targetIndexName = "good-books"
+                  } | ConvertTo-Json -Compress -Depth 100
+                  $newIndexer = Invoke-RestMethod -Method POST -Uri "https://$(acsName).search.windows.net/indexers?api-version=2020-06-30" -body $body -ContentType "application/json" -headers @{ authorization="Bearer $access_token" }
+
+                  Write-Host "Created Indexer:"
+                  Write-Host $newIndexer
+                }
+              enabled: true
+
+          - task: AzureCLI@2
+          # This step removes all DevOps agent IPs added before fromn the SQL server and the Cognitive Search service
+            displayName: Remove ADO agent public IP from SQL Server and Cognitive Search
+            condition: always() # this will always run, even if the pipeline is canceled
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnectionName }}
+              addSpnToEnvironment: true
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $ado_agent_ip = curl ifconfig.me
+                Write-Host "Removing $ado_agent_ip from SQL Server $(sqlResourceName)"
+                az sql server firewall-rule delete -g ${{ parameters.rsgName }} -s $(sqlResourceName) -n DevopsAgentTemp
+
+                $currentIps = (az search service show --name $(acsName) --resource-group ${{ parameters.rsgName }} | ConvertFrom-Json).networkRuleSet.ipRules.value
+                $acsAllowedIps = ($currentIps -split "," | Where-Object {$_ -ne $ado_agent_ip}) -join ","
+                az search service update --name $(acsName) --resource-group ${{ parameters.rsgName }} --ip-rules $acsAllowedIps
+            enabled: true
+
+      - job: DeployCompute${{ parameters.environment }}
+        dependsOn:
+        - BuildContainer${{ parameters.environment }}
+        - PrepareDatabase${{ parameters.environment }}
+        - DeployInfrastructure${{ parameters.environment }}
+        
+        condition: succeeded()
+
+        variables:
+          acrResourceName: $[ dependencies.DeployInfrastructure${{ parameters.environment }}.outputs['TFPlanApply.acrName'] ]
+          aasResourceName: $[ dependencies.DeployInfrastructure${{ parameters.environment }}.outputs['TFPlanApply.aasName'] ]
+        
+        steps:
+          - checkout: self
+
+          - task: AzureWebAppContainer@1
+            displayName: 'Azure Web App on Container Deploy'
+            inputs:
+                azureSubscription: '${{ parameters.serviceConnectionName }}'
+                appName: $(aasResourceName)
+                imageName: $(acrResourceName).azurecr.io/${{ lower(parameters.webappComponentName) }}:latest
